@@ -55,9 +55,10 @@ class ExportTaskService(BaseModuleService):
         if mask_svc and hasattr(mask_svc, "mask_fields"):
             source_rows = mask_svc.mask_fields(api_name, source_rows)
 
-        # 写入导出文件
-        from app.services.data_manager import write_export
-        columns = list(source_rows[0].keys()) if source_rows else []
+        # 写入导出文件：版本化落盘并交付可核对的完成凭证；
+        # 合法零行（如过滤规则删完所有行）也必须交付表头。
+        from app.services.data_manager import write_export_version
+        columns = list(source_rows[0].keys()) if source_rows else self._schema_columns(api_name)
         export_data = {
             "export_id": export_id,
             "task_no": entry.get("任务编号"),
@@ -69,7 +70,7 @@ class ExportTaskService(BaseModuleService):
             "rows": [[str(r.get(c, "")) for c in columns] for r in source_rows],
             "status": "已完成",
         }
-        write_export(export_id, export_data)
+        receipt = write_export_version(export_id, export_data)
 
         # 写审计记录
         from app.services.data_manager import write_audit
@@ -81,11 +82,48 @@ class ExportTaskService(BaseModuleService):
             "event": "export_completed",
             "export_id": export_id,
             "rows_count": len(source_rows),
+            "export_version": receipt.get("version"),
+            "checksum": receipt.get("checksum"),
         })
 
         entry["status"] = "已完成"
         entry["数据行数"] = str(len(source_rows))
-        return {"ok": True, "export_id": export_id, "rows_count": len(source_rows)}
+        entry["导出版本"] = str(receipt.get("version"))
+        return {"ok": True, "export_id": export_id, "rows_count": len(source_rows),
+                "receipt": receipt}
+
+    def _schema_columns(self, api_name: str) -> list[str]:
+        """零行导出仍要交付表头：按数据源 schema 给出列清单。"""
+        sample = self._mock_query(api_name)
+        return list(sample[0].keys()) if sample else []
+
+    def simulate_interrupted_export(self, export_id: int,
+                                    columns: list[str] | None = None) -> dict[str, Any]:
+        """模拟取数中途任务中断：留下写到半程的空文件（无完成凭证）。
+
+        半成品文件只提升 manifest 的 pending_version，不交付完成事实；
+        归并侧据此判定该侧输入凭证不完整。
+        """
+        entry = store.find(self.MODULE, export_id)
+        if entry is None:
+            return {"ok": False, "message": "任务不存在"}
+
+        from app.services.data_manager import write_partial_export
+        api_name = entry.get("关联API", "")
+        manifest = write_partial_export(export_id, {
+            "export_id": export_id,
+            "task_no": entry.get("任务编号"),
+            "api_name": api_name,
+            "query_params": entry.get("查询参数"),
+            "columns": columns if columns is not None else self._schema_columns(api_name),
+            "rows": [],
+            "status": "导出中",
+            "interrupted": True,
+        })
+        entry["status"] = "导出中"
+        return {"ok": True, "export_id": export_id,
+                "pending_version": manifest.get("pending_version"),
+                "message": "导出中断，留下半成品文件"}
 
     def _mock_query(self, api_name: str) -> list[dict[str, Any]]:
         """模拟从数据源查询结果。"""
@@ -113,7 +151,9 @@ class ExportTaskService(BaseModuleService):
             entry["pending"] = False
             from app.services.data_manager import write_module_snapshot
             write_module_snapshot(self.MODULE, self.domain_snapshot())
-            return entry, f"导出任务已完成，共{result.get('rows_count', 0)}行"
+            receipt = result.get("receipt") or {}
+            return entry, (f"导出任务已完成，共{result.get('rows_count', 0)}行"
+                           f"（版本 v{receipt.get('version', 1)}）")
 
         result = super().run_action(entry_id, action)
         from app.services.data_manager import write_module_snapshot

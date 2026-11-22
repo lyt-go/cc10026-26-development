@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -44,6 +45,11 @@ def _write_json(path: Path, data: Any) -> None:
 
 def _now_iso() -> str:
     return datetime.now(TZ).isoformat()
+
+
+def now_iso() -> str:
+    """公开的时间戳助手，供各业务服务记录业务事实时间。"""
+    return _now_iso()
 
 
 # ========== API 注册快照 ==========
@@ -249,10 +255,160 @@ def list_exports() -> list[dict[str, Any]]:
     _ensure_dir(DATA_ROOT / "exports")
     records = []
     for f in sorted(DATA_ROOT.glob("exports/[0-9]*.json")):
+        # 只认当前版本指针文件，排除 .v{n}/.manifest/.partial 等附属文件
+        if not f.stem.isdigit():
+            continue
         record = _read_json(f)
         if record:
             records.append(record)
     return records
+
+
+# ========== 导出版本与完成凭证 ==========
+
+
+def export_checksum(columns: list[Any], rows: list[Any]) -> str:
+    """对导出表头与数据行计算内容校验和，作为可核对的完成事实。"""
+    payload = json.dumps({"columns": list(columns), "rows": rows},
+                         ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _export_manifest_path(export_id: int) -> Path:
+    return DATA_ROOT / "exports" / f"{export_id:06d}.manifest.json"
+
+
+def _export_version_path(export_id: int, version: int) -> Path:
+    return DATA_ROOT / "exports" / f"{export_id:06d}.v{version}.json"
+
+
+def _export_partial_path(export_id: int) -> Path:
+    return DATA_ROOT / "exports" / f"{export_id:06d}.partial.json"
+
+
+def read_export_manifest(export_id: int) -> dict[str, Any]:
+    """读取导出版本清单：最后完成版本、进行中的重发版本与历史版本。"""
+    return _read_json(_export_manifest_path(export_id), {})
+
+
+def write_partial_export(export_id: int, partial_data: dict[str, Any]) -> dict[str, Any]:
+    """写入取数中途的半成品导出文件（无完成凭证）。
+
+    任务中断时文件已落盘但取数未完成：manifest 只提升 pending_version，
+    current_version 不变，归并侧据此判定输入凭证不完整。
+    """
+    manifest = read_export_manifest(export_id)
+    current = int(manifest.get("current_version") or 0)
+    pending = int(manifest.get("pending_version") or 0)
+    partial_data["_partial"] = True
+    partial_data["_started_at"] = _now_iso()
+    _write_json(_export_partial_path(export_id), partial_data)
+    manifest.update({
+        "export_id": export_id,
+        "current_version": current,
+        "pending_version": max(current, pending) + 1,
+    })
+    manifest.setdefault("versions", [])
+    _write_json(_export_manifest_path(export_id), manifest)
+    return manifest
+
+
+def write_export_version(export_id: int, export_data: dict[str, Any]) -> dict[str, Any]:
+    """以新版本写入导出产物，并交付可核对的完成凭证（receipt）。
+
+    版本单调递增；旧版本文件保留，已确认的归并结果仍可按当时版本回查。
+    凭证包含：版本号、表头、行数、内容校验和、完成时间与真实来源。
+    """
+    manifest = read_export_manifest(export_id)
+    current = int(manifest.get("current_version") or 0)
+    pending = int(manifest.get("pending_version") or 0)
+    # 中断时已预订的 pending_version 由本次完成承接；否则递增
+    version = pending if pending > current else current + 1
+    columns = list(export_data.get("columns") or [])
+    rows = export_data.get("rows") or []
+    receipt = {
+        "export_id": export_id,
+        "version": version,
+        "task_no": export_data.get("task_no"),
+        "api_name": export_data.get("api_name"),
+        "query_params": export_data.get("query_params"),
+        "columns": columns,
+        "rows_count": len(rows),
+        "checksum": export_checksum(columns, rows),
+        "status": "已完成",
+        "completed_at": _now_iso(),
+    }
+    version_doc = {
+        **export_data,
+        "version": version,
+        "receipt": receipt,
+        "_created_at": export_data.get("_created_at", _now_iso()),
+        "_updated_at": _now_iso(),
+    }
+    _write_json(_export_version_path(export_id, version), version_doc)
+    # 当前版本指针：保持既有 {id:06d}.json 指向最新完成版本
+    _write_json(DATA_ROOT / "exports" / f"{export_id:06d}.json", version_doc)
+    _write_export_csv(export_id, version_doc)
+    # 重发完成，清掉中断留下的半成品文件
+    partial = _export_partial_path(export_id)
+    if partial.exists():
+        partial.unlink()
+    versions = manifest.setdefault("versions", [])
+    versions.append({
+        "version": version,
+        "checksum": receipt["checksum"],
+        "rows_count": len(rows),
+        "completed_at": receipt["completed_at"],
+    })
+    manifest.update({
+        "export_id": export_id,
+        "current_version": version,
+        "pending_version": None,
+    })
+    _write_json(_export_manifest_path(export_id), manifest)
+    return receipt
+
+
+def read_export_version(export_id: int, version: int | None = None) -> dict[str, Any]:
+    """读取指定版本的导出产物；version=None 时读取当前完成版本。"""
+    if version is None:
+        return read_export(export_id)
+    return _read_json(_export_version_path(export_id, version), {})
+
+
+def read_export_receipt(export_id: int, version: int | None = None) -> dict[str, Any]:
+    """读取导出完成凭证（可核对的完成事实）。"""
+    doc = read_export_version(export_id, version)
+    return doc.get("receipt", {}) if doc else {}
+
+
+# ========== 归并运行记录 ==========
+
+
+def next_merge_run_id() -> int:
+    existing = [f for f in DATA_ROOT.glob("merge_runs/[0-9]*.json") if f.stem.isdigit()]
+    return max((int(f.stem) for f in existing), default=0) + 1
+
+
+def write_merge_run(run_id: int, run: dict[str, Any]) -> None:
+    """写入一次归并运行记录（含空结果校验明细与确认版本）。"""
+    _write_json(DATA_ROOT / "merge_runs" / f"{run_id:06d}.json", run)
+
+
+def read_merge_run(run_id: int) -> dict[str, Any]:
+    return _read_json(DATA_ROOT / "merge_runs" / f"{run_id:06d}.json", {})
+
+
+def list_merge_runs() -> list[dict[str, Any]]:
+    _ensure_dir(DATA_ROOT / "merge_runs")
+    runs = []
+    for f in sorted(DATA_ROOT.glob("merge_runs/[0-9]*.json")):
+        if not f.stem.isdigit():
+            continue
+        run = _read_json(f)
+        if run:
+            runs.append(run)
+    return runs
 
 
 # ========== 模块数据快照 ==========
